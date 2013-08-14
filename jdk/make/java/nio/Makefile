@@ -300,6 +300,11 @@ FILES_c += \
 	KQueue.c \
 	KQueuePort.c
 
+ifndef COMPILE_AGAINST_SYSCALLS
+FILES_c += \
+	syscalls_fp.c
+endif
+
 FILES_export += \
 	sun/nio/ch/InheritedChannel.java \
 	sun/nio/ch/KQueue.java \
