@@ -23,13 +23,15 @@
  */
 
 #include "precompiled.hpp"
+#include "gc_implementation/shared/copyFailedInfo.hpp"
 #include "gc_implementation/shared/gcHeapSummary.hpp"
 #include "gc_implementation/shared/gcTimer.hpp"
 #include "gc_implementation/shared/gcTrace.hpp"
-#include "gc_implementation/shared/copyFailedInfo.hpp"
+#include "gc_implementation/shared/objectCountEventSender.hpp"
 #include "memory/heapInspection.hpp"
 #include "memory/iterator.hpp"
 #include "memory/referenceProcessorStats.hpp"
+#include "runtime/os.hpp"
 #include "utilities/globalDefinitions.hpp"
 
 #ifndef SERIALGC
@@ -39,7 +41,7 @@
 #define assert_unset_gc_id() assert(_shared_gc_info.id() == SharedGCInfo::UNSET_GCID, "GC already started?")
 #define assert_set_gc_id() assert(_shared_gc_info.id() != SharedGCInfo::UNSET_GCID, "GC not started?")
 
-static jlong GCTracer_next_gc_id = 0;
+static GCId GCTracer_next_gc_id = 0;
 static GCId create_new_gc_id() {
   return GCTracer_next_gc_id++;
 }
@@ -92,24 +94,69 @@ void GCTracer::report_gc_reference_stats(const ReferenceProcessorStats& rps) con
 }
 
 class ObjectCountEventSenderClosure : public KlassInfoClosure {
-  GCTracer* _gc_tracer;
+  const GCId _gc_id;
+  const double _size_threshold_percentage;
+  const size_t _total_size_in_words;
+  const jlong _timestamp;
+
  public:
-  ObjectCountEventSenderClosure(GCTracer* gc_tracer) : _gc_tracer(gc_tracer) {}
+  ObjectCountEventSenderClosure(GCId gc_id, size_t total_size_in_words, jlong timestamp) :
+    _gc_id(gc_id),
+    _size_threshold_percentage(ObjectCountCutOffPercent / 100),
+    _total_size_in_words(total_size_in_words),
+    _timestamp(timestamp)
+  {}
+
+  virtual void do_cinfo(KlassInfoEntry* entry) {
+    if (should_send_event(entry)) {
+      ObjectCountEventSender::send(entry, _gc_id, _timestamp);
+    }
+  }
+
  private:
-  void do_cinfo(KlassInfoEntry* entry) {
-    _gc_tracer->send_object_count_after_gc_event(entry->klass(), entry->count(),
-                                                 entry->words() * BytesPerWord);
+  bool should_send_event(const KlassInfoEntry* entry) const {
+    double percentage_of_heap = ((double) entry->words()) / _total_size_in_words;
+    return percentage_of_heap >= _size_threshold_percentage;
+  }
+};
+
+class ObjectCountFilter : public BoolObjectClosure {
+  BoolObjectClosure* _is_alive;
+
+ public:
+  ObjectCountFilter(BoolObjectClosure* is_alive) : _is_alive(is_alive) {
+    assert(is_alive != NULL, "Must supply function to check liveness");
+  }
+
+  bool do_object_b(oop obj) {
+    return _is_alive->do_object_b(obj) && is_externally_visible_klass(obj->klass());
+  }
+
+  void do_object(oop obj) { ShouldNotReachHere(); }
+
+ private:
+  bool is_externally_visible_klass(klassOop k) const {
+    // Do not expose internal implementation specific classes
+    return (k->klass_part()->oop_is_instance() || k->klass_part()->oop_is_array()) &&
+           k != Universe::systemObjArrayKlassObj();
   }
 };
 
 void GCTracer::report_object_count_after_gc(BoolObjectClosure *is_alive_cl) {
-  if (should_send_object_count_after_gc_event()) {
+  assert_set_gc_id();
+  assert(is_alive_cl != NULL, "Must supply function to check liveness");
+
+  if (ObjectCountEventSender::should_send_event()) {
     ResourceMark rm;
 
     KlassInfoTable cit(HeapInspection::start_of_perm_gen());
     if (!cit.allocation_failed()) {
-      ObjectCountEventSenderClosure event_sender(this);
-      HeapInspection::instance_inspection(&cit, &event_sender, false, is_alive_cl);
+      ObjectCountFilter object_filter(is_alive_cl);
+      HeapInspection::populate_table(&cit, false, &object_filter);
+
+      jlong timestamp = os::elapsed_counter();
+      ObjectCountEventSenderClosure event_sender(_shared_gc_info.id(), cit.size_of_instances_in_words(), timestamp);
+      cit.iterate(&event_sender);
     }
   }
 }
@@ -161,7 +208,7 @@ void ParallelOldTracer::report_dense_prefix(void* dense_prefix) {
   _parallel_old_gc_info.report_dense_prefix(dense_prefix);
 }
 
-void CMSTracer::report_concurrent_mode_failure() {
+void OldGCTracer::report_concurrent_mode_failure() {
   assert_set_gc_id();
 
   send_concurrent_mode_failure_event();
@@ -185,5 +232,12 @@ void G1NewTracer::report_evacuation_info(EvacuationInfo* info) {
   assert_set_gc_id();
 
   send_evacuation_info_event(info);
+}
+
+void G1NewTracer::report_evacuation_failed(EvacuationFailedInfo& ef_info) {
+  assert_set_gc_id();
+
+  send_evacuation_failed_event(ef_info);
+  ef_info.reset();
 }
 #endif

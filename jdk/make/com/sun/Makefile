@@ -38,7 +38,7 @@ SUBDIRS_management = jmx
 SUBDIRS_desktop    = image
 SUBDIRS_enterprise = crypto/provider jndi \
                      org rowset net/httpserver
-SUBDIRS_misc       = script tracing servicetag nio demo
+SUBDIRS_misc       = script tracing nio demo
 
 # Omit mirror since it's built with the apt tool.
 SUBDIRS_tools      = tools

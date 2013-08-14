@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001, 2012, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2001, 2013, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -406,7 +406,6 @@ void G1CollectorPolicy::init() {
   }
   _free_regions_at_end_of_collection = _g1->free_regions();
   update_young_list_target_length();
-  _prev_eden_capacity = _young_list_target_length * HeapRegion::GrainBytes;
 
   // We may immediately start allocating regions and placing them on the
   // collection set list. Initialize the per-collection set info
@@ -746,6 +745,7 @@ G1CollectorPolicy::verify_young_ages(HeapRegion* head,
 
 void G1CollectorPolicy::record_full_collection_start() {
   _full_collection_start_sec = os::elapsedTime();
+  record_heap_size_info_at_start();
   // Release the future to-space so that it is available for compaction into.
   _g1->set_full_collection();
 }
@@ -788,8 +788,7 @@ void G1CollectorPolicy::record_stop_world_start() {
   _stop_world_start = os::elapsedTime();
 }
 
-void G1CollectorPolicy::record_collection_pause_start(double start_time_sec,
-                                                      size_t start_used) {
+void G1CollectorPolicy::record_collection_pause_start(double start_time_sec) {
   // We only need to do this here as the policy will only be applied
   // to the GC we're about to start. so, no point is calculating this
   // every time we calculate / recalculate the target young length.
@@ -803,18 +802,13 @@ void G1CollectorPolicy::record_collection_pause_start(double start_time_sec,
   _trace_gen0_time_data.record_start_collection(s_w_t_ms);
   _stop_world_start = 0.0;
 
+  record_heap_size_info_at_start();
+
   phase_times()->record_cur_collection_start_sec(start_time_sec);
-  _cur_collection_pause_used_at_start_bytes = start_used;
-  _cur_collection_pause_used_regions_at_start = _g1->used_regions();
   _pending_cards = _g1->pending_card_num();
 
   _collection_set_bytes_used_before = 0;
   _bytes_copied_during_gc = 0;
-
-  YoungList* young_list = _g1->young_list();
-  _eden_bytes_before_gc = young_list->eden_used_bytes();
-  _survivor_bytes_before_gc = young_list->survivor_used_bytes();
-  _capacity_before_gc = _g1->capacity();
 
   _last_gc_was_young = false;
 
@@ -1156,6 +1150,21 @@ void G1CollectorPolicy::record_collection_pause_end(double pause_time_ms, Evacua
   byte_size_in_proper_unit((double)(bytes)),                    \
   proper_unit_for_byte_size((bytes))
 
+void G1CollectorPolicy::record_heap_size_info_at_start() {
+  YoungList* young_list = _g1->young_list();
+  _eden_bytes_before_gc = young_list->eden_used_bytes();
+  _survivor_bytes_before_gc = young_list->survivor_used_bytes();
+  _capacity_before_gc = _g1->capacity();
+
+  _cur_collection_pause_used_at_start_bytes = _g1->used();
+  _cur_collection_pause_used_regions_at_start = _g1->used_regions();
+
+  size_t eden_capacity_before_gc =
+         (_young_list_target_length * HeapRegion::GrainBytes) - _survivor_bytes_before_gc;
+
+  _prev_eden_capacity = eden_capacity_before_gc;
+}
+
 void G1CollectorPolicy::print_heap_transition() {
   _g1->print_size_transition(gclog_or_tty,
     _cur_collection_pause_used_at_start_bytes, _g1->used(), _g1->capacity());
@@ -1186,8 +1195,6 @@ void G1CollectorPolicy::print_detailed_heap_transition() {
       EXT_SIZE_PARAMS(_capacity_before_gc),
       EXT_SIZE_PARAMS(used),
       EXT_SIZE_PARAMS(capacity));
-
-    _prev_eden_capacity = eden_capacity;
 }
 
 void G1CollectorPolicy::adjust_concurrent_refinement(double update_rs_time,
@@ -1809,6 +1816,14 @@ void G1CollectorPolicy::print_collection_set(HeapRegion* list_head, outputStream
 }
 #endif // !PRODUCT
 
+double G1CollectorPolicy::reclaimable_bytes_perc(size_t reclaimable_bytes) {
+  // Returns the given amount of reclaimable bytes (that represents
+  // the amount of reclaimable space still to be collected) as a
+  // percentage of the current heap capacity.
+  size_t capacity_bytes = _g1->capacity();
+  return (double) reclaimable_bytes * 100.0 / (double) capacity_bytes;
+}
+
 bool G1CollectorPolicy::next_gc_should_be_mixed(const char* true_action_str,
                                                 const char* false_action_str) {
   CollectionSetChooser* cset_chooser = _collectionSetChooser;
@@ -1818,19 +1833,21 @@ bool G1CollectorPolicy::next_gc_should_be_mixed(const char* true_action_str,
                   ergo_format_reason("candidate old regions not available"));
     return false;
   }
+
+  // Is the amount of uncollected reclaimable space above G1HeapWastePercent?
   size_t reclaimable_bytes = cset_chooser->remaining_reclaimable_bytes();
-  size_t capacity_bytes = _g1->capacity();
-  double perc = (double) reclaimable_bytes * 100.0 / (double) capacity_bytes;
+  double reclaimable_perc = reclaimable_bytes_perc(reclaimable_bytes);
   double threshold = (double) G1HeapWastePercent;
-  if (perc < threshold) {
+  if (reclaimable_perc <= threshold) {
     ergo_verbose4(ErgoMixedGCs,
               false_action_str,
-              ergo_format_reason("reclaimable percentage lower than threshold")
+              ergo_format_reason("reclaimable percentage not over threshold")
               ergo_format_region("candidate old regions")
               ergo_format_byte_perc("reclaimable")
               ergo_format_perc("threshold"),
               cset_chooser->remaining_regions(),
-              reclaimable_bytes, perc, threshold);
+              reclaimable_bytes,
+              reclaimable_perc, threshold);
     return false;
   }
 
@@ -1841,8 +1858,47 @@ bool G1CollectorPolicy::next_gc_should_be_mixed(const char* true_action_str,
                 ergo_format_byte_perc("reclaimable")
                 ergo_format_perc("threshold"),
                 cset_chooser->remaining_regions(),
-                reclaimable_bytes, perc, threshold);
+                reclaimable_bytes,
+                reclaimable_perc, threshold);
   return true;
+}
+
+uint G1CollectorPolicy::calc_min_old_cset_length() {
+  // The min old CSet region bound is based on the maximum desired
+  // number of mixed GCs after a cycle. I.e., even if some old regions
+  // look expensive, we should add them to the CSet anyway to make
+  // sure we go through the available old regions in no more than the
+  // maximum desired number of mixed GCs.
+  //
+  // The calculation is based on the number of marked regions we added
+  // to the CSet chooser in the first place, not how many remain, so
+  // that the result is the same during all mixed GCs that follow a cycle.
+
+  const size_t region_num = (size_t) _collectionSetChooser->length();
+  const size_t gc_num = (size_t) MAX2(G1MixedGCCountTarget, (uintx) 1);
+  size_t result = region_num / gc_num;
+  // emulate ceiling
+  if (result * gc_num < region_num) {
+    result += 1;
+  }
+  return (uint) result;
+}
+
+uint G1CollectorPolicy::calc_max_old_cset_length() {
+  // The max old CSet region bound is based on the threshold expressed
+  // as a percentage of the heap size. I.e., it should bound the
+  // number of old regions added to the CSet irrespective of how many
+  // of them are available.
+
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+  const size_t region_num = g1h->n_regions();
+  const size_t perc = (size_t) G1OldCSetRegionThresholdPercent;
+  size_t result = region_num * perc / 100;
+  // emulate ceiling
+  if (100 * result < region_num * perc) {
+    result += 1;
+  }
+  return (uint) result;
 }
 
 void G1CollectorPolicy::finalize_cset(double target_pause_time_ms, EvacuationInfo& evacuation_info) {
@@ -1858,7 +1914,7 @@ void G1CollectorPolicy::finalize_cset(double target_pause_time_ms, EvacuationInf
 
   double base_time_ms = predict_base_elapsed_time_ms(_pending_cards);
   double predicted_pause_time_ms = base_time_ms;
-  double time_remaining_ms = target_pause_time_ms - base_time_ms;
+  double time_remaining_ms = MAX2(target_pause_time_ms - base_time_ms, 0.0);
 
   ergo_verbose4(ErgoCSetConstruction | ErgoHigh,
                 "start choosing CSet",
@@ -1896,7 +1952,7 @@ void G1CollectorPolicy::finalize_cset(double target_pause_time_ms, EvacuationInf
 
   _collection_set = _inc_cset_head;
   _collection_set_bytes_used_before = _inc_cset_bytes_used_before;
-  time_remaining_ms -= _inc_cset_predicted_elapsed_time_ms;
+  time_remaining_ms = MAX2(time_remaining_ms - _inc_cset_predicted_elapsed_time_ms, 0.0);
   predicted_pause_time_ms += _inc_cset_predicted_elapsed_time_ms;
 
   ergo_verbose3(ErgoCSetConstruction | ErgoHigh,
@@ -1920,8 +1976,8 @@ void G1CollectorPolicy::finalize_cset(double target_pause_time_ms, EvacuationInf
   if (!gcs_are_young()) {
     CollectionSetChooser* cset_chooser = _collectionSetChooser;
     cset_chooser->verify();
-    const uint min_old_cset_length = cset_chooser->calc_min_old_cset_length();
-    const uint max_old_cset_length = cset_chooser->calc_max_old_cset_length();
+    const uint min_old_cset_length = calc_min_old_cset_length();
+    const uint max_old_cset_length = calc_max_old_cset_length();
 
     uint expensive_region_num = 0;
     bool check_time_remaining = adaptive_young_list_length();
@@ -1936,6 +1992,30 @@ void G1CollectorPolicy::finalize_cset(double target_pause_time_ms, EvacuationInf
                       ergo_format_region("old")
                       ergo_format_region("max"),
                       old_cset_region_length(), max_old_cset_length);
+        break;
+      }
+
+
+      // Stop adding regions if the remaining reclaimable space is
+      // not above G1HeapWastePercent.
+      size_t reclaimable_bytes = cset_chooser->remaining_reclaimable_bytes();
+      double reclaimable_perc = reclaimable_bytes_perc(reclaimable_bytes);
+      double threshold = (double) G1HeapWastePercent;
+      if (reclaimable_perc <= threshold) {
+        // We've added enough old regions that the amount of uncollected
+        // reclaimable space is at or below the waste threshold. Stop
+        // adding old regions to the CSet.
+        ergo_verbose5(ErgoCSetConstruction,
+                      "finish adding old regions to CSet",
+                      ergo_format_reason("reclaimable percentage not over threshold")
+                      ergo_format_region("old")
+                      ergo_format_region("max")
+                      ergo_format_byte_perc("reclaimable")
+                      ergo_format_perc("threshold"),
+                      old_cset_region_length(),
+                      max_old_cset_length,
+                      reclaimable_bytes,
+                      reclaimable_perc, threshold);
         break;
       }
 
@@ -1978,7 +2058,7 @@ void G1CollectorPolicy::finalize_cset(double target_pause_time_ms, EvacuationInf
       }
 
       // We will add this region to the CSet.
-      time_remaining_ms -= predicted_time_ms;
+      time_remaining_ms = MAX2(time_remaining_ms - predicted_time_ms, 0.0);
       predicted_pause_time_ms += predicted_time_ms;
       cset_chooser->remove_and_move_to_next(hr);
       _g1->old_set_remove(hr);

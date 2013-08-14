@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2012, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2013, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -2302,6 +2302,10 @@ class CommandLineFlags {
           "Print diagnostic message when GC is stalled"                     \
           "by JNI critical section")                                        \
                                                                             \
+  experimental(double, ObjectCountCutOffPercent, 0.5,                       \
+          "The percentage of the used heap that the instances of a class "  \
+          "must occupy for the class to generate a trace event.")           \
+                                                                            \
   /* GC log rotation setting */                                             \
                                                                             \
   product(bool, UseGCLogFileRotation, false,                                \
@@ -3616,7 +3620,7 @@ class CommandLineFlags {
   diagnostic(bool, PrintDTraceDOF, false,                                   \
              "Print the DTrace DOF passed to the system for JSDT probes")   \
                                                                             \
-  product(uintx, StringTableSize, 1009,                                     \
+  product(uintx, StringTableSize, NOT_LP64(1009) LP64_ONLY(60013),          \
           "Number of buckets in the interned String table")                 \
                                                                             \
   product(bool, UseVMInterruptibleIO, false,                                \
@@ -3633,8 +3637,15 @@ class CommandLineFlags {
   product(bool, PrintGCCause, true,                                         \
           "Include GC cause in GC logging")                                 \
                                                                             \
+  experimental(uintx, ArrayAllocatorMallocLimit,                            \
+          SOLARIS_ONLY(64*K) NOT_SOLARIS(max_uintx),                        \
+          "Allocation less than this value will be allocated "              \
+          "using malloc. Larger allocations will use mmap.")                \
+                                                                            \
   product(bool, EnableTracing, false,                                       \
-                  "Enable event-based tracing")
+                  "Enable event-based tracing")                             \
+  product(bool, UseLockedTracing, false,                                    \
+          "Use locked-tracing when doing event-based tracing")
 
 /*
  *  Macros for factoring of globals

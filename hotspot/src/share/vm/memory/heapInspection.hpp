@@ -55,16 +55,16 @@ class KlassInfoEntry: public CHeapObj<mtInternal> {
   {}
   KlassInfoEntry* next()     { return _next; }
   bool is_equal(klassOop k)  { return k == _klass; }
-  klassOop klass()           { return _klass; }
-  long count()               { return _instance_count; }
+  klassOop klass() const     { return _klass; }
+  long count() const         { return _instance_count; }
   void set_count(long ct)    { _instance_count = ct; }
-  size_t words()             { return _instance_words; }
+  size_t words() const       { return _instance_words; }
   void set_words(size_t wds) { _instance_words = wds; }
   int compare(KlassInfoEntry* e1, KlassInfoEntry* e2);
   void print_on(outputStream* st) const;
 };
 
-class KlassInfoClosure: public StackObj {
+class KlassInfoClosure : public StackObj {
  public:
   // Called for each KlassInfoEntry.
   virtual void do_cinfo(KlassInfoEntry* cie) = 0;
@@ -86,6 +86,7 @@ class KlassInfoTable: public StackObj {
  private:
   int _size;
   static const int _num_buckets = 20011;
+  size_t _size_of_instances_in_words;
 
   // An aligned reference address (typically the least
   // address in the perm gen) used for hashing klass
@@ -102,6 +103,7 @@ class KlassInfoTable: public StackObj {
   bool record_instance(const oop obj);
   void iterate(KlassInfoClosure* cic);
   bool allocation_failed() { return _buckets == NULL; }
+  size_t size_of_instances_in_words() const;
 };
 
 class KlassInfoHisto : public StackObj {
@@ -125,10 +127,9 @@ class KlassInfoHisto : public StackObj {
 class HeapInspection : public AllStatic {
  public:
   static void heap_inspection(outputStream* st, bool need_prologue);
-  static size_t instance_inspection(KlassInfoTable* cit,
-                                    KlassInfoClosure* cl,
-                                    bool need_prologue,
-                                    BoolObjectClosure* filter = NULL);
+  static size_t populate_table(KlassInfoTable* cit,
+                               bool need_prologue,
+                               BoolObjectClosure* filter = NULL);
   static HeapWord* start_of_perm_gen();
   static void find_instances_at_safepoint(klassOop k, GrowableArray<oop>* result);
  private:

@@ -970,6 +970,18 @@ extern "C" objc_registerThreadWithCollector_t objc_registerThreadWithCollectorFu
 objc_registerThreadWithCollector_t objc_registerThreadWithCollectorFunction = NULL;
 #endif
 
+#ifdef __APPLE__
+static uint64_t locate_unique_thread_id() {
+  // Additional thread_id used to correlate threads in SA
+  thread_identifier_info_data_t     m_ident_info;
+  mach_msg_type_number_t            count = THREAD_IDENTIFIER_INFO_COUNT;
+
+  thread_info(::mach_thread_self(), THREAD_IDENTIFIER_INFO,
+              (thread_info_t) &m_ident_info, &count);
+  return m_ident_info.thread_id;
+}
+#endif
+
 // Thread start routine for all newly created threads
 static void *java_start(Thread *thread) {
   // Try to randomize the cache line index of hot stack frames.
@@ -999,6 +1011,7 @@ static void *java_start(Thread *thread) {
 #ifdef __APPLE__
   // thread_id is mach thread on macos
   osthread->set_thread_id(::mach_thread_self());
+  osthread->set_unique_thread_id(locate_unique_thread_id());
 #else
   // thread_id is pthread_id on BSD
   osthread->set_thread_id(::pthread_self());
@@ -1195,6 +1208,7 @@ bool os::create_attached_thread(JavaThread* thread) {
 #ifdef _ALLBSD_SOURCE
 #ifdef __APPLE__
   osthread->set_thread_id(::mach_thread_self());
+  osthread->set_unique_thread_id(locate_unique_thread_id());
 #else
   osthread->set_thread_id(::pthread_self());
 #endif
@@ -2653,16 +2667,117 @@ static volatile jint pending_signals[NSIG+1] = { 0 };
 
 // Bsd(POSIX) specific hand shaking semaphore.
 #ifdef __APPLE__
-static semaphore_t sig_sem;
+typedef semaphore_t os_semaphore_t;
 #define SEM_INIT(sem, value)    semaphore_create(mach_task_self(), &sem, SYNC_POLICY_FIFO, value)
-#define SEM_WAIT(sem)           semaphore_wait(sem);
-#define SEM_POST(sem)           semaphore_signal(sem);
+#define SEM_WAIT(sem)           semaphore_wait(sem)
+#define SEM_POST(sem)           semaphore_signal(sem)
+#define SEM_DESTROY(sem)        semaphore_destroy(mach_task_self(), sem)
 #else
-static sem_t sig_sem;
+typedef sem_t os_semaphore_t;
 #define SEM_INIT(sem, value)    sem_init(&sem, 0, value)
-#define SEM_WAIT(sem)           sem_wait(&sem);
-#define SEM_POST(sem)           sem_post(&sem);
+#define SEM_WAIT(sem)           sem_wait(&sem)
+#define SEM_POST(sem)           sem_post(&sem)
+#define SEM_DESTROY(sem)        sem_destroy(&sem)
 #endif
+
+class Semaphore : public StackObj {
+  public:
+    Semaphore();
+    ~Semaphore();
+    void signal();
+    void wait();
+    bool trywait();
+    bool timedwait(unsigned int sec, int nsec);
+  private:
+    jlong currenttime() const;
+    semaphore_t _semaphore;
+};
+
+Semaphore::Semaphore() : _semaphore(0) {
+  SEM_INIT(_semaphore, 0);
+}
+
+Semaphore::~Semaphore() {
+  SEM_DESTROY(_semaphore);
+}
+
+void Semaphore::signal() {
+  SEM_POST(_semaphore);
+}
+
+void Semaphore::wait() {
+  SEM_WAIT(_semaphore);
+}
+
+jlong Semaphore::currenttime() const {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * NANOSECS_PER_SEC) + (tv.tv_usec * 1000);
+}
+
+#ifdef __APPLE__
+bool Semaphore::trywait() {
+  return timedwait(0, 0);
+}
+
+bool Semaphore::timedwait(unsigned int sec, int nsec) {
+  kern_return_t kr = KERN_ABORTED;
+  mach_timespec_t waitspec;
+  waitspec.tv_sec = sec;
+  waitspec.tv_nsec = nsec;
+
+  jlong starttime = currenttime();
+
+  kr = semaphore_timedwait(_semaphore, waitspec);
+  while (kr == KERN_ABORTED) {
+    jlong totalwait = (sec * NANOSECS_PER_SEC) + nsec;
+
+    jlong current = currenttime();
+    jlong passedtime = current - starttime;
+
+    if (passedtime >= totalwait) {
+      waitspec.tv_sec = 0;
+      waitspec.tv_nsec = 0;
+    } else {
+      jlong waittime = totalwait - (current - starttime);
+      waitspec.tv_sec = waittime / NANOSECS_PER_SEC;
+      waitspec.tv_nsec = waittime % NANOSECS_PER_SEC;
+    }
+
+    kr = semaphore_timedwait(_semaphore, waitspec);
+  }
+
+  return kr == KERN_SUCCESS;
+}
+
+#else
+
+bool Semaphore::trywait() {
+  return sem_trywait(&_semaphore) == 0;
+}
+
+bool Semaphore::timedwait(unsigned int sec, int nsec) {
+  struct timespec ts;
+  jlong endtime = unpackTime(&ts, false, (sec * NANOSECS_PER_SEC) + nsec);
+
+  while (1) {
+    int result = sem_timedwait(&_semaphore, &ts);
+    if (result == 0) {
+      return true;
+    } else if (errno == EINTR) {
+      continue;
+    } else if (errno == ETIMEDOUT) {
+      return false;
+    } else {
+      return false;
+    }
+  }
+}
+
+#endif // __APPLE__
+
+static os_semaphore_t sig_sem;
+static Semaphore sr_semaphore;
 
 void os::signal_init_pd() {
   // Initialize signal structures
@@ -2774,6 +2889,13 @@ void bsd_wrap_code(char* base, size_t size) {
   }
 }
 
+static void warn_fail_commit_memory(char* addr, size_t size, bool exec,
+                                    int err) {
+  warning("INFO: os::commit_memory(" PTR_FORMAT ", " SIZE_FORMAT
+          ", %d) failed; error='%s' (errno=%d)", addr, size, exec,
+          strerror(err), err);
+}
+
 // NOTE: Bsd kernel does not really reserve the pages for us.
 //       All it does is to check if there are enough free pages
 //       left at the time of mmap(). This could be a potential
@@ -2782,12 +2904,22 @@ bool os::pd_commit_memory(char* addr, size_t size, bool exec) {
   int prot = exec ? PROT_READ|PROT_WRITE|PROT_EXEC : PROT_READ|PROT_WRITE;
 #ifdef __OpenBSD__
   // XXX: Work-around mmap/MAP_FIXED bug temporarily on OpenBSD
-  return ::mprotect(addr, size, prot) == 0;
+  if (::mprotect(addr, size, prot) == 0) {
+    return true;
+  }
 #else
   uintptr_t res = (uintptr_t) ::mmap(addr, size, prot,
                                    MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
-  return res != (uintptr_t) MAP_FAILED;
+  if (res != (uintptr_t) MAP_FAILED) {
+    return true;
+  }
 #endif
+
+  // Warn about any commit errors we see in non-product builds just
+  // in case mmap() doesn't work as described on the man page.
+  NOT_PRODUCT(warn_fail_commit_memory(addr, size, exec, errno);)
+
+  return false;
 }
 
 #ifndef _ALLBSD_SOURCE
@@ -2815,7 +2947,25 @@ bool os::pd_commit_memory(char* addr, size_t size, size_t alignment_hint,
   }
 #endif
 
-  return commit_memory(addr, size, exec);
+  // alignment_hint is ignored on this OS
+  return pd_commit_memory(addr, size, exec);
+}
+
+void os::pd_commit_memory_or_exit(char* addr, size_t size, bool exec,
+                                  const char* mesg) {
+  assert(mesg != NULL, "mesg must be specified");
+  if (!pd_commit_memory(addr, size, exec)) {
+    // add extra info in product mode for vm_exit_out_of_memory():
+    PRODUCT_ONLY(warn_fail_commit_memory(addr, size, exec, errno);)
+    vm_exit_out_of_memory(size, mesg);
+  }
+}
+
+void os::pd_commit_memory_or_exit(char* addr, size_t size,
+                                  size_t alignment_hint, bool exec,
+                                  const char* mesg) {
+  // alignment_hint is ignored on this OS
+  pd_commit_memory_or_exit(addr, size, exec, mesg);
 }
 
 void os::pd_realign_memory(char *addr, size_t bytes, size_t alignment_hint) {
@@ -2982,7 +3132,7 @@ bool os::pd_uncommit_memory(char* addr, size_t size) {
 }
 
 bool os::pd_create_stack_guard_pages(char* addr, size_t size) {
-  return os::commit_memory(addr, size);
+  return os::commit_memory(addr, size, !ExecMem);
 }
 
 // If this is a growable mapping, remove the guard pages entirely by
@@ -3317,21 +3467,20 @@ char* os::reserve_memory_special(size_t bytes, char* req_addr, bool exec) {
   }
 
   // The memory is committed
-  address pc = CALLER_PC;
-  MemTracker::record_virtual_memory_reserve((address)addr, bytes, pc);
-  MemTracker::record_virtual_memory_commit((address)addr, bytes, pc);
+  MemTracker::record_virtual_memory_reserve_and_commit((address)addr, bytes, mtNone, CALLER_PC);
 
   return addr;
 }
 
 bool os::release_memory_special(char* base, size_t bytes) {
+  MemTracker::Tracker tkr = MemTracker::get_virtual_memory_release_tracker();
   // detaching the SHM segment will also delete it, see reserve_memory_special()
   int rslt = shmdt(base);
   if (rslt == 0) {
-    MemTracker::record_virtual_memory_uncommit((address)base, bytes);
-    MemTracker::record_virtual_memory_release((address)base, bytes);
+    tkr.record((address)base, bytes);
     return true;
   } else {
+    tkr.discard();
     return false;
   }
 
@@ -3777,12 +3926,14 @@ static void SR_handler(int sig, siginfo_t* siginfo, ucontext_t* context) {
       pthread_sigmask(SIG_BLOCK, NULL, &suspend_set);
       sigdelset(&suspend_set, SR_signum);
 
+      sr_semaphore.signal();
       // wait here until we are resumed
       while (1) {
         sigsuspend(&suspend_set);
 
         os::SuspendResume::State result = osthread->sr.running();
         if (result == os::SuspendResume::SR_RUNNING) {
+          sr_semaphore.signal();
           break;
         } else if (result != os::SuspendResume::SR_SUSPENDED) {
           ShouldNotReachHere();
@@ -3801,7 +3952,7 @@ static void SR_handler(int sig, siginfo_t* siginfo, ucontext_t* context) {
   } else if (current == os::SuspendResume::SR_WAKEUP_REQUEST) {
     // ignore
   } else {
-    ShouldNotReachHere();
+    // ignore
   }
 
   errno = old_errno;
@@ -3865,8 +4016,9 @@ static const int RANDOMLY_LARGE_INTEGER2 = 100;
 // but this seems the normal response to library errors
 static bool do_suspend(OSThread* osthread) {
   assert(osthread->sr.is_running(), "thread should be running");
-  // mark as suspended and send signal
+  assert(!sr_semaphore.trywait(), "semaphore has invalid state");
 
+  // mark as suspended and send signal
   if (osthread->sr.request_suspend() != os::SuspendResume::SR_SUSPEND_REQUEST) {
     // failed to switch, state wasn't running?
     ShouldNotReachHere();
@@ -3874,35 +4026,22 @@ static bool do_suspend(OSThread* osthread) {
   }
 
   if (sr_notify(osthread) != 0) {
-    // try to cancel, switch to running
-
-    os::SuspendResume::State result = osthread->sr.cancel_suspend();
-    if (result == os::SuspendResume::SR_RUNNING) {
-      // cancelled
-      return false;
-    } else if (result == os::SuspendResume::SR_SUSPENDED) {
-      // somehow managed to suspend
-      return true;
-    } else {
-      ShouldNotReachHere();
-      return false;
-    }
+    ShouldNotReachHere();
   }
 
   // managed to send the signal and switch to SUSPEND_REQUEST, now wait for SUSPENDED
-
-  for (int n = 0; !osthread->sr.is_suspended(); n++) {
-    for (int i = 0; i < RANDOMLY_LARGE_INTEGER2 && !osthread->sr.is_suspended(); i++) {
-      os::yield_all(i);
-    }
-
-    // timeout, try to cancel the request
-    if (n >= RANDOMLY_LARGE_INTEGER) {
+  while (true) {
+    if (sr_semaphore.timedwait(0, 2 * NANOSECS_PER_MILLISEC)) {
+      break;
+    } else {
+      // timeout
       os::SuspendResume::State cancelled = osthread->sr.cancel_suspend();
       if (cancelled == os::SuspendResume::SR_RUNNING) {
         return false;
       } else if (cancelled == os::SuspendResume::SR_SUSPENDED) {
-        return true;
+        // make sure that we consume the signal on the semaphore as well
+        sr_semaphore.wait();
+        break;
       } else {
         ShouldNotReachHere();
         return false;
@@ -3916,6 +4055,7 @@ static bool do_suspend(OSThread* osthread) {
 
 static void do_resume(OSThread* osthread) {
   assert(osthread->sr.is_suspended(), "thread should be suspended");
+  assert(!sr_semaphore.trywait(), "invalid semaphore state");
 
   if (osthread->sr.request_wakeup() != os::SuspendResume::SR_WAKEUP_REQUEST) {
     // failed to switch to WAKEUP_REQUEST
@@ -3923,11 +4063,11 @@ static void do_resume(OSThread* osthread) {
     return;
   }
 
-  while (!osthread->sr.is_running()) {
+  while (true) {
     if (sr_notify(osthread) == 0) {
-      for (int n = 0; n < RANDOMLY_LARGE_INTEGER && !osthread->sr.is_running(); n++) {
-        for (int i = 0; i < 100 && !osthread->sr.is_running(); i++) {
-          os::yield_all(i);
+      if (sr_semaphore.timedwait(0, 2 * NANOSECS_PER_MILLISEC)) {
+        if (osthread->sr.is_running()) {
+          return;
         }
       }
     } else {
@@ -4163,6 +4303,19 @@ void os::Bsd::set_signal_handler(int sig, bool set_installed) {
     sigAct.sa_sigaction = signalHandler;
     sigAct.sa_flags = SA_SIGINFO|SA_RESTART;
   }
+#if __APPLE__
+  // Needed for main thread as XNU (Mac OS X kernel) will only deliver SIGSEGV
+  // (which starts as SIGBUS) on main thread with faulting address inside "stack+guard pages"
+  // if the signal handler declares it will handle it on alternate stack.
+  // Notice we only declare we will handle it on alt stack, but we are not
+  // actually going to use real alt stack - this is just a workaround.
+  // Please see ux_exception.c, method catch_mach_exception_raise for details
+  // link http://www.opensource.apple.com/source/xnu/xnu-2050.18.24/bsd/uxkern/ux_exception.c
+  if (sig == SIGSEGV) {
+    sigAct.sa_flags |= SA_ONSTACK;
+  }
+#endif
+
   // Save flags, which are set by ours
   assert(sig > 0 && sig < MAXSIGNUM, "vm signal out of expected range");
   sigflags[sig] = sigAct.sa_flags;
@@ -4547,7 +4700,7 @@ jint os::init_2(void)
 
   if (!UseMembar) {
     address mem_serialize_page = (address) ::mmap(NULL, Bsd::page_size(), PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    guarantee( mem_serialize_page != NULL, "mmap Failed for memory serialize page");
+    guarantee( mem_serialize_page != MAP_FAILED, "mmap Failed for memory serialize page");
     os::set_memory_serialize_page( mem_serialize_page );
 
 #ifndef PRODUCT
@@ -5922,3 +6075,4 @@ int os::get_core_path(char* buffer, size_t bufferSize) {
 
   return n;
 }
+

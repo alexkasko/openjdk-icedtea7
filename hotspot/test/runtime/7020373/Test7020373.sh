@@ -10,56 +10,15 @@
 ##
 
 if [ "${TESTSRC}" = "" ]
-then TESTSRC=.
-fi
-
-if [ "${TESTJAVA}" = "" ]
 then
-  PARENT=`dirname \`which java\``
-  TESTJAVA=`dirname ${PARENT}`
-  echo "TESTJAVA not set, selecting " ${TESTJAVA}
-  echo "If this is incorrect, try setting the variable manually."
+  TESTSRC=${PWD}
+  echo "TESTSRC not set.  Using "${TESTSRC}" as default"
 fi
+echo "TESTSRC=${TESTSRC}"
+## Adding common setup Variables for running shell tests.
+. ${TESTSRC}/../../test_env.sh
 
-if [ "${TESTCLASSES}" = "" ]
-then
-  echo "TESTCLASSES not set.  Test cannot execute.  Failed."
-  exit 1
-fi
-
-# set platform-dependent variables
-OS=`uname -s`
-case "$OS" in
-  SunOS | Linux | Darwin )
-    NULL=/dev/null
-    PS=":"
-    FS="/"
-    ;;
-  Windows_* )
-    NULL=NUL
-    PS=";"
-    FS="\\"
-    ;;
-  CYGWIN_* )
-    NULL=/dev/null
-    PS=";"
-    FS="/"
-    ;;
-  * )
-    echo "Unrecognized system!"
-    exit 1;
-    ;;
-esac
-
-JEMMYPATH=${CPAPPEND}
-CLASSPATH=.${PS}${TESTCLASSES}${PS}${JEMMYPATH} ; export CLASSPATH
-
-THIS_DIR=`pwd`
-
-${TESTJAVA}${FS}bin${FS}java ${TESTVMOPTS} -version
-
-# first step: compile GenOOMCrash generator
-${TESTJAVA}${FS}bin${FS}javac GenOOMCrashClass.java
+${COMPILEJAVA}${FS}bin${FS}jar xvf ${TESTSRC}${FS}testcase.jar
 
 # second step: run the generator to create test class
 ${TESTJAVA}${FS}bin${FS}java GenOOMCrashClass 1 4000

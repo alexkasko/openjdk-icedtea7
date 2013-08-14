@@ -1156,7 +1156,6 @@ void Arguments::set_cms_and_parnew_gc_flags() {
     set_parnew_gc_flags();
   }
 
-  // MaxHeapSize is aligned down in collectorPolicy
   size_t max_heap = align_size_down(MaxHeapSize,
                                     CardTableRS::ct_max_alignment_constraint());
 
@@ -1194,10 +1193,6 @@ void Arguments::set_cms_and_parnew_gc_flags() {
     }
 
     // Code along this path potentially sets NewSize and OldSize
-
-    assert(max_heap >= InitialHeapSize, "Error");
-    assert(max_heap >= NewSize, "Error");
-
     if (PrintGCDetails && Verbose) {
       // Too early to use gclog_or_tty
       tty->print_cr("CMS set min_heap_size: " SIZE_FORMAT
@@ -1504,6 +1499,15 @@ void Arguments::set_g1_gc_flags() {
   }
 }
 
+void Arguments::set_heap_base_min_address() {
+  if (FLAG_IS_DEFAULT(HeapBaseMinAddress) && UseG1GC && HeapBaseMinAddress < 1*G) {
+    // By default HeapBaseMinAddress is 2G on all platforms except Solaris x86.
+    // G1 currently needs a lot of C-heap, so on Solaris we have to give G1
+    // some extra space for the C-heap compared to other collectors.
+    FLAG_SET_ERGO(uintx, HeapBaseMinAddress, 1*G);
+  }
+}
+
 void Arguments::set_heap_size() {
   if (!FLAG_IS_DEFAULT(DefaultMaxRAMFraction)) {
     // Deprecated flag
@@ -1604,8 +1608,12 @@ void Arguments::set_bytecode_flags() {
 void Arguments::set_aggressive_opts_flags() {
 #ifdef COMPILER2
   if (AggressiveOpts || !FLAG_IS_DEFAULT(AutoBoxCacheMax)) {
+    // EliminateAutoBox code is broken in C2
     if (FLAG_IS_DEFAULT(EliminateAutoBox)) {
-      FLAG_SET_DEFAULT(EliminateAutoBox, true);
+      // FLAG_SET_DEFAULT(EliminateAutoBox, true);
+    }
+    if (EliminateAutoBox) {
+      FLAG_SET_DEFAULT(EliminateAutoBox, false);
     }
     if (FLAG_IS_DEFAULT(AutoBoxCacheMax)) {
       FLAG_SET_DEFAULT(AutoBoxCacheMax, 20000);
@@ -1943,6 +1951,10 @@ bool Arguments::check_vm_args_consistency() {
                                         "G1RefProcDrainInterval");
     status = status && verify_min_value((intx)G1ConcMarkStepDurationMillis, 1,
                                         "G1ConcMarkStepDurationMillis");
+    status = status && verify_interval(G1ConcRSHotCardLimit, 0, max_jubyte,
+                                       "G1ConcRSHotCardLimit");
+    status = status && verify_interval(G1ConcRSLogCacheSize, 0, 31,
+                                       "G1ConcRSLogCacheSize");
   }
 #endif
 
@@ -3149,6 +3161,7 @@ jint Arguments::parse(const JavaVMInitArgs* args) {
         "Incompatible compilation policy selected", NULL);
     }
   }
+  set_heap_base_min_address();
   // Set heap size based on available physical memory
   set_heap_size();
   // Set per-collector flags

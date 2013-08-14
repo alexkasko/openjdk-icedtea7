@@ -143,6 +143,7 @@ int (*os::Linux::_pthread_getcpuclockid)(pthread_t, clockid_t *) = NULL;
 Mutex* os::Linux::_createThread_lock = NULL;
 pthread_t os::Linux::_main_thread;
 int os::Linux::_page_size = -1;
+const int os::Linux::_vm_default_page_size = (8 * K);
 bool os::Linux::_is_floating_stack = false;
 bool os::Linux::_is_NPTL = false;
 bool os::Linux::_supports_fast_thread_cpu_time = false;
@@ -167,6 +168,9 @@ sigset_t SR_sigset;
 
 /* Used to protect dlsym() calls */
 static pthread_mutex_t dl_mutex;
+
+// Declarations
+static void unpackTime(timespec* absTime, bool isAbsolute, jlong time);
 
 #ifdef JAVASE_EMBEDDED
 class MemNotifyThread: public Thread {
@@ -2477,6 +2481,57 @@ void* os::user_handler() {
   return CAST_FROM_FN_PTR(void*, UserHandler);
 }
 
+class Semaphore : public StackObj {
+  public:
+    Semaphore();
+    ~Semaphore();
+    void signal();
+    void wait();
+    bool trywait();
+    bool timedwait(unsigned int sec, int nsec);
+  private:
+    sem_t _semaphore;
+};
+
+
+Semaphore::Semaphore() {
+  sem_init(&_semaphore, 0, 0);
+}
+
+Semaphore::~Semaphore() {
+  sem_destroy(&_semaphore);
+}
+
+void Semaphore::signal() {
+  sem_post(&_semaphore);
+}
+
+void Semaphore::wait() {
+  sem_wait(&_semaphore);
+}
+
+bool Semaphore::trywait() {
+  return sem_trywait(&_semaphore) == 0;
+}
+
+bool Semaphore::timedwait(unsigned int sec, int nsec) {
+  struct timespec ts;
+  unpackTime(&ts, false, (sec * NANOSECS_PER_SEC) + nsec);
+
+  while (1) {
+    int result = sem_timedwait(&_semaphore, &ts);
+    if (result == 0) {
+      return true;
+    } else if (errno == EINTR) {
+      continue;
+    } else if (errno == ETIMEDOUT) {
+      return false;
+    } else {
+      return false;
+    }
+  }
+}
+
 extern "C" {
   typedef void (*sa_handler_t)(int);
   typedef void (*sa_sigaction_t)(int, siginfo_t *, void *);
@@ -2516,6 +2571,7 @@ static volatile jint pending_signals[NSIG+1] = { 0 };
 
 // Linux(POSIX) specific hand shaking semaphore.
 static sem_t sig_sem;
+static Semaphore sr_semaphore;
 
 void os::signal_init_pd() {
   // Initialize signal structures
@@ -2627,11 +2683,49 @@ void linux_wrap_code(char* base, size_t size) {
   }
 }
 
+static bool recoverable_mmap_error(int err) {
+  // See if the error is one we can let the caller handle. This
+  // list of errno values comes from JBS-6843484. I can't find a
+  // Linux man page that documents this specific set of errno
+  // values so while this list currently matches Solaris, it may
+  // change as we gain experience with this failure mode.
+  switch (err) {
+  case EBADF:
+  case EINVAL:
+  case ENOTSUP:
+    // let the caller deal with these errors
+    return true;
+
+  default:
+    // Any remaining errors on this OS can cause our reserved mapping
+    // to be lost. That can cause confusion where different data
+    // structures think they have the same memory mapped. The worst
+    // scenario is if both the VM and a library think they have the
+    // same memory mapped.
+    return false;
+  }
+}
+
+static void warn_fail_commit_memory(char* addr, size_t size, bool exec,
+                                    int err) {
+  warning("INFO: os::commit_memory(" PTR_FORMAT ", " SIZE_FORMAT
+          ", %d) failed; error='%s' (errno=%d)", addr, size, exec,
+          strerror(err), err);
+}
+
+static void warn_fail_commit_memory(char* addr, size_t size,
+                                    size_t alignment_hint, bool exec,
+                                    int err) {
+  warning("INFO: os::commit_memory(" PTR_FORMAT ", " SIZE_FORMAT
+          ", " SIZE_FORMAT ", %d) failed; error='%s' (errno=%d)", addr, size,
+          alignment_hint, exec, strerror(err), err);
+}
+
 // NOTE: Linux kernel does not really reserve the pages for us.
 //       All it does is to check if there are enough free pages
 //       left at the time of mmap(). This could be a potential
 //       problem.
-bool os::pd_commit_memory(char* addr, size_t size, bool exec) {
+int os::Linux::commit_memory_impl(char* addr, size_t size, bool exec) {
   int prot = exec ? PROT_READ|PROT_WRITE|PROT_EXEC : PROT_READ|PROT_WRITE;
   uintptr_t res = (uintptr_t) ::mmap(addr, size, prot,
                                    MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
@@ -2639,9 +2733,32 @@ bool os::pd_commit_memory(char* addr, size_t size, bool exec) {
     if (UseNUMAInterleaving) {
       numa_make_global(addr, size);
     }
-    return true;
+    return 0;
   }
-  return false;
+
+  int err = errno;  // save errno from mmap() call above
+
+  if (!recoverable_mmap_error(err)) {
+    warn_fail_commit_memory(addr, size, exec, err);
+    vm_exit_out_of_memory(size, "committing reserved memory.");
+  }
+
+  return err;
+}
+
+bool os::pd_commit_memory(char* addr, size_t size, bool exec) {
+  return os::Linux::commit_memory_impl(addr, size, exec) == 0;
+}
+
+void os::pd_commit_memory_or_exit(char* addr, size_t size, bool exec,
+                                  const char* mesg) {
+  assert(mesg != NULL, "mesg must be specified");
+  int err = os::Linux::commit_memory_impl(addr, size, exec);
+  if (err != 0) {
+    // the caller wants all commit errors to exit with the specified mesg:
+    warn_fail_commit_memory(addr, size, exec, err);
+    vm_exit_out_of_memory(size, mesg);
+  }
 }
 
 // Define MAP_HUGETLB here so we can build HotSpot on old systems.
@@ -2654,8 +2771,9 @@ bool os::pd_commit_memory(char* addr, size_t size, bool exec) {
 #define MADV_HUGEPAGE 14
 #endif
 
-bool os::pd_commit_memory(char* addr, size_t size, size_t alignment_hint,
-                       bool exec) {
+int os::Linux::commit_memory_impl(char* addr, size_t size,
+                                  size_t alignment_hint, bool exec) {
+  int err;
   if (UseHugeTLBFS && alignment_hint > (size_t)vm_page_size()) {
     int prot = exec ? PROT_READ|PROT_WRITE|PROT_EXEC : PROT_READ|PROT_WRITE;
     uintptr_t res =
@@ -2666,16 +2784,45 @@ bool os::pd_commit_memory(char* addr, size_t size, size_t alignment_hint,
       if (UseNUMAInterleaving) {
         numa_make_global(addr, size);
       }
-      return true;
+      return 0;
+    }
+
+    err = errno;  // save errno from mmap() call above
+
+    if (!recoverable_mmap_error(err)) {
+      // However, it is not clear that this loss of our reserved mapping
+      // happens with large pages on Linux or that we cannot recover
+      // from the loss. For now, we just issue a warning and we don't
+      // call vm_exit_out_of_memory(). This issue is being tracked by
+      // JBS-8007074.
+      warn_fail_commit_memory(addr, size, alignment_hint, exec, err);
+//    vm_exit_out_of_memory(size, "committing reserved memory.");
     }
     // Fall through and try to use small pages
   }
 
-  if (commit_memory(addr, size, exec)) {
+  err = os::Linux::commit_memory_impl(addr, size, exec);
+  if (err == 0) {
     realign_memory(addr, size, alignment_hint);
-    return true;
   }
-  return false;
+  return err;
+}
+
+bool os::pd_commit_memory(char* addr, size_t size, size_t alignment_hint,
+                          bool exec) {
+  return os::Linux::commit_memory_impl(addr, size, alignment_hint, exec) == 0;
+}
+
+void os::pd_commit_memory_or_exit(char* addr, size_t size,
+                                  size_t alignment_hint, bool exec,
+                                  const char* mesg) {
+  assert(mesg != NULL, "mesg must be specified");
+  int err = os::Linux::commit_memory_impl(addr, size, alignment_hint, exec);
+  if (err != 0) {
+    // the caller wants all commit errors to exit with the specified mesg:
+    warn_fail_commit_memory(addr, size, alignment_hint, exec, err);
+    vm_exit_out_of_memory(size, mesg);
+  }
 }
 
 void os::pd_realign_memory(char *addr, size_t bytes, size_t alignment_hint) {
@@ -2693,7 +2840,7 @@ void os::pd_free_memory(char *addr, size_t bytes, size_t alignment_hint) {
   // small pages on top of the SHM segment. This method always works for small pages, so we
   // allow that in any case.
   if (alignment_hint <= (size_t)os::vm_page_size() || !UseSHM) {
-    commit_memory(addr, bytes, alignment_hint, false);
+    commit_memory(addr, bytes, alignment_hint, !ExecMem);
   }
 }
 
@@ -2946,7 +3093,7 @@ bool os::pd_create_stack_guard_pages(char* addr, size_t size) {
       ::munmap((void*)stack_extent, (uintptr_t)addr - stack_extent);
   }
 
-  return os::commit_memory(addr, size);
+  return os::commit_memory(addr, size, !ExecMem);
 }
 
 // If this is a growable mapping, remove the guard pages entirely by
@@ -3067,7 +3214,7 @@ bool os::Linux::hugetlbfs_sanity_check(bool warn, size_t page_size) {
                   MAP_ANONYMOUS|MAP_PRIVATE|MAP_HUGETLB,
                   -1, 0);
 
-  if (p != (void *) -1) {
+  if (p != MAP_FAILED) {
     // We don't know if this really is a huge page or not.
     FILE *fp = fopen("/proc/self/maps", "r");
     if (fp) {
@@ -3285,21 +3432,20 @@ char* os::reserve_memory_special(size_t bytes, char* req_addr, bool exec) {
   }
 
   // The memory is committed
-  address pc = CALLER_PC;
-  MemTracker::record_virtual_memory_reserve((address)addr, bytes, pc);
-  MemTracker::record_virtual_memory_commit((address)addr, bytes, pc);
+  MemTracker::record_virtual_memory_reserve_and_commit((address)addr, bytes, mtNone, CALLER_PC);
 
   return addr;
 }
 
 bool os::release_memory_special(char* base, size_t bytes) {
+  MemTracker::Tracker tkr = MemTracker::get_virtual_memory_release_tracker();
   // detaching the SHM segment will also delete it, see reserve_memory_special()
   int rslt = shmdt(base);
   if (rslt == 0) {
-    MemTracker::record_virtual_memory_uncommit((address)base, bytes);
-    MemTracker::record_virtual_memory_release((address)base, bytes);
+    tkr.record((address)base, bytes);
     return true;
   } else {
+    tkr.discard();
    return false;
   }
 }
@@ -3671,12 +3817,14 @@ static void SR_handler(int sig, siginfo_t* siginfo, ucontext_t* context) {
       pthread_sigmask(SIG_BLOCK, NULL, &suspend_set);
       sigdelset(&suspend_set, SR_signum);
 
+      sr_semaphore.signal();
       // wait here until we are resumed
       while (1) {
         sigsuspend(&suspend_set);
 
         os::SuspendResume::State result = osthread->sr.running();
         if (result == os::SuspendResume::SR_RUNNING) {
+          sr_semaphore.signal();
           break;
         }
       }
@@ -3693,7 +3841,7 @@ static void SR_handler(int sig, siginfo_t* siginfo, ucontext_t* context) {
   } else if (current == os::SuspendResume::SR_WAKEUP_REQUEST) {
     // ignore
   } else {
-    ShouldNotReachHere();
+    // ignore
   }
 
   errno = old_errno;
@@ -3757,8 +3905,9 @@ static const int RANDOMLY_LARGE_INTEGER2 = 100;
 // but this seems the normal response to library errors
 static bool do_suspend(OSThread* osthread) {
   assert(osthread->sr.is_running(), "thread should be running");
-  // mark as suspended and send signal
+  assert(!sr_semaphore.trywait(), "semaphore has invalid state");
 
+  // mark as suspended and send signal
   if (osthread->sr.request_suspend() != os::SuspendResume::SR_SUSPEND_REQUEST) {
     // failed to switch, state wasn't running?
     ShouldNotReachHere();
@@ -3766,35 +3915,22 @@ static bool do_suspend(OSThread* osthread) {
   }
 
   if (sr_notify(osthread) != 0) {
-    // try to cancel, switch to running
-
-    os::SuspendResume::State result = osthread->sr.cancel_suspend();
-    if (result == os::SuspendResume::SR_RUNNING) {
-      // cancelled
-      return false;
-    } else if (result == os::SuspendResume::SR_SUSPENDED) {
-      // somehow managed to suspend
-      return true;
-    } else {
-      ShouldNotReachHere();
-      return false;
-    }
+    ShouldNotReachHere();
   }
 
   // managed to send the signal and switch to SUSPEND_REQUEST, now wait for SUSPENDED
-
-  for (int n = 0; !osthread->sr.is_suspended(); n++) {
-    for (int i = 0; i < RANDOMLY_LARGE_INTEGER2 && !osthread->sr.is_suspended(); i++) {
-      os::yield_all(i);
-    }
-
-    // timeout, try to cancel the request
-    if (n >= RANDOMLY_LARGE_INTEGER) {
+  while (true) {
+    if (sr_semaphore.timedwait(0, 2 * NANOSECS_PER_MILLISEC)) {
+      break;
+    } else {
+      // timeout
       os::SuspendResume::State cancelled = osthread->sr.cancel_suspend();
       if (cancelled == os::SuspendResume::SR_RUNNING) {
         return false;
       } else if (cancelled == os::SuspendResume::SR_SUSPENDED) {
-        return true;
+        // make sure that we consume the signal on the semaphore as well
+        sr_semaphore.wait();
+        break;
       } else {
         ShouldNotReachHere();
         return false;
@@ -3808,6 +3944,7 @@ static bool do_suspend(OSThread* osthread) {
 
 static void do_resume(OSThread* osthread) {
   assert(osthread->sr.is_suspended(), "thread should be suspended");
+  assert(!sr_semaphore.trywait(), "invalid semaphore state");
 
   if (osthread->sr.request_wakeup() != os::SuspendResume::SR_WAKEUP_REQUEST) {
     // failed to switch to WAKEUP_REQUEST
@@ -3815,11 +3952,11 @@ static void do_resume(OSThread* osthread) {
     return;
   }
 
-  while (!osthread->sr.is_running()) {
+  while (true) {
     if (sr_notify(osthread) == 0) {
-      for (int n = 0; n < RANDOMLY_LARGE_INTEGER && !osthread->sr.is_running(); n++) {
-        for (int i = 0; i < 100 && !osthread->sr.is_running(); i++) {
-          os::yield_all(i);
+      if (sr_semaphore.timedwait(0, 2 * NANOSECS_PER_MILLISEC)) {
+        if (osthread->sr.is_running()) {
+          return;
         }
       }
     } else {
@@ -4382,6 +4519,15 @@ void os::init(void) {
   Linux::clock_init();
   initial_time_count = os::elapsed_counter();
   pthread_mutex_init(&dl_mutex, NULL);
+
+  // If the pagesize of the VM is greater than 8K determine the appropriate
+  // number of initial guard pages.  The user can change this with the
+  // command line arguments, if needed.
+  if (vm_page_size() > (int)Linux::vm_default_page_size()) {
+    StackYellowPages = 1;
+    StackRedPages = 1;
+    StackShadowPages = round_to((StackShadowPages*Linux::vm_default_page_size()), vm_page_size()) / vm_page_size();
+  }
 }
 
 // To install functions for atexit system call
@@ -4409,7 +4555,7 @@ jint os::init_2(void)
 
   if (!UseMembar) {
     address mem_serialize_page = (address) ::mmap(NULL, Linux::page_size(), PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    guarantee( mem_serialize_page != NULL, "mmap Failed for memory serialize page");
+    guarantee( mem_serialize_page != MAP_FAILED, "mmap Failed for memory serialize page");
     os::set_memory_serialize_page( mem_serialize_page );
 
 #ifndef PRODUCT
@@ -4435,8 +4581,8 @@ jint os::init_2(void)
   // Add in 2*BytesPerWord times page size to account for VM stack during
   // class initialization depending on 32 or 64 bit VM.
   os::Linux::min_stack_allowed = MAX2(os::Linux::min_stack_allowed,
-            (size_t)(StackYellowPages+StackRedPages+StackShadowPages+
-                    2*BytesPerWord COMPILER2_PRESENT(+1)) * Linux::page_size());
+            (size_t)(StackYellowPages+StackRedPages+StackShadowPages) * Linux::page_size() +
+                    (2*BytesPerWord COMPILER2_PRESENT(+1)) * Linux::vm_default_page_size());
 
   size_t threadStackSizeInBytes = ThreadStackSize * K;
   if (threadStackSizeInBytes != 0 &&
@@ -5791,4 +5937,5 @@ void MemNotifyThread::start() {
     new MemNotifyThread(fd);
   }
 }
+
 #endif // JAVASE_EMBEDDED

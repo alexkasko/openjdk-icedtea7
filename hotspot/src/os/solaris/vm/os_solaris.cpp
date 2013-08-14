@@ -247,6 +247,8 @@ extern "C" {
   static int pthread_cond_default_init(cond_t *cv, int scope, void *arg){ memset(cv, 0, sizeof(cond_t)); return 0; }
 }
 
+static void unpackTime(timespec* absTime, bool isAbsolute, jlong time);
+
 // Thread Local Storage
 // This is common to all Solaris platforms so it is defined here,
 // in this common file.
@@ -2604,6 +2606,57 @@ void* os::user_handler() {
   return CAST_FROM_FN_PTR(void*, UserHandler);
 }
 
+class Semaphore : public StackObj {
+  public:
+    Semaphore();
+    ~Semaphore();
+    void signal();
+    void wait();
+    bool trywait();
+    bool timedwait(unsigned int sec, int nsec);
+  private:
+    sema_t _semaphore;
+};
+
+
+Semaphore::Semaphore() {
+  sema_init(&_semaphore, 0, NULL, NULL);
+}
+
+Semaphore::~Semaphore() {
+  sema_destroy(&_semaphore);
+}
+
+void Semaphore::signal() {
+  sema_post(&_semaphore);
+}
+
+void Semaphore::wait() {
+  sema_wait(&_semaphore);
+}
+
+bool Semaphore::trywait() {
+  return sema_trywait(&_semaphore) == 0;
+}
+
+bool Semaphore::timedwait(unsigned int sec, int nsec) {
+  struct timespec ts;
+  unpackTime(&ts, false, (sec * NANOSECS_PER_SEC) + nsec);
+
+  while (1) {
+    int result = sema_timedwait(&_semaphore, &ts);
+    if (result == 0) {
+      return true;
+    } else if (errno == EINTR) {
+      continue;
+    } else if (errno == ETIME) {
+      return false;
+    } else {
+      return false;
+    }
+  }
+}
+
 extern "C" {
   typedef void (*sa_handler_t)(int);
   typedef void (*sa_sigaction_t)(int, siginfo_t *, void *);
@@ -2755,7 +2808,42 @@ int os::vm_allocation_granularity() {
   return page_size;
 }
 
-bool os::pd_commit_memory(char* addr, size_t bytes, bool exec) {
+static bool recoverable_mmap_error(int err) {
+  // See if the error is one we can let the caller handle. This
+  // list of errno values comes from the Solaris mmap(2) man page.
+  switch (err) {
+  case EBADF:
+  case EINVAL:
+  case ENOTSUP:
+    // let the caller deal with these errors
+    return true;
+
+  default:
+    // Any remaining errors on this OS can cause our reserved mapping
+    // to be lost. That can cause confusion where different data
+    // structures think they have the same memory mapped. The worst
+    // scenario is if both the VM and a library think they have the
+    // same memory mapped.
+    return false;
+  }
+}
+
+static void warn_fail_commit_memory(char* addr, size_t bytes, bool exec,
+                                    int err) {
+  warning("INFO: os::commit_memory(" PTR_FORMAT ", " SIZE_FORMAT
+          ", %d) failed; error='%s' (errno=%d)", addr, bytes, exec,
+          strerror(err), err);
+}
+
+static void warn_fail_commit_memory(char* addr, size_t bytes,
+                                    size_t alignment_hint, bool exec,
+                                    int err) {
+  warning("INFO: os::commit_memory(" PTR_FORMAT ", " SIZE_FORMAT
+          ", " SIZE_FORMAT ", %d) failed; error='%s' (errno=%d)", addr, bytes,
+          alignment_hint, exec, strerror(err), err);
+}
+
+int os::Solaris::commit_memory_impl(char* addr, size_t bytes, bool exec) {
   int prot = exec ? PROT_READ|PROT_WRITE|PROT_EXEC : PROT_READ|PROT_WRITE;
   size_t size = bytes;
   char *res = Solaris::mmap_chunk(addr, size, MAP_PRIVATE|MAP_FIXED, prot);
@@ -2763,14 +2851,38 @@ bool os::pd_commit_memory(char* addr, size_t bytes, bool exec) {
     if (UseNUMAInterleaving) {
       numa_make_global(addr, bytes);
     }
-    return true;
+    return 0;
   }
-  return false;
+
+  int err = errno;  // save errno from mmap() call in mmap_chunk()
+
+  if (!recoverable_mmap_error(err)) {
+    warn_fail_commit_memory(addr, bytes, exec, err);
+    vm_exit_out_of_memory(bytes, "committing reserved memory.");
+  }
+
+  return err;
 }
 
-bool os::pd_commit_memory(char* addr, size_t bytes, size_t alignment_hint,
-                       bool exec) {
-  if (commit_memory(addr, bytes, exec)) {
+bool os::pd_commit_memory(char* addr, size_t bytes, bool exec) {
+  return Solaris::commit_memory_impl(addr, bytes, exec) == 0;
+}
+
+void os::pd_commit_memory_or_exit(char* addr, size_t bytes, bool exec,
+                                  const char* mesg) {
+  assert(mesg != NULL, "mesg must be specified");
+  int err = os::Solaris::commit_memory_impl(addr, bytes, exec);
+  if (err != 0) {
+    // the caller wants all commit errors to exit with the specified mesg:
+    warn_fail_commit_memory(addr, bytes, exec, err);
+    vm_exit_out_of_memory(bytes, mesg);
+  }
+}
+
+int os::Solaris::commit_memory_impl(char* addr, size_t bytes,
+                                    size_t alignment_hint, bool exec) {
+  int err = Solaris::commit_memory_impl(addr, bytes, exec);
+  if (err == 0) {
     if (UseMPSS && alignment_hint > (size_t)vm_page_size()) {
       // If the large page size has been set and the VM
       // is using large pages, use the large page size
@@ -2792,9 +2904,25 @@ bool os::pd_commit_memory(char* addr, size_t bytes, size_t alignment_hint,
       // Since this is a hint, ignore any failures.
       (void)Solaris::set_mpss_range(addr, bytes, page_size);
     }
-    return true;
   }
-  return false;
+  return err;
+}
+
+bool os::pd_commit_memory(char* addr, size_t bytes, size_t alignment_hint,
+                          bool exec) {
+  return Solaris::commit_memory_impl(addr, bytes, alignment_hint, exec) == 0;
+}
+
+void os::pd_commit_memory_or_exit(char* addr, size_t bytes,
+                                  size_t alignment_hint, bool exec,
+                                  const char* mesg) {
+  assert(mesg != NULL, "mesg must be specified");
+  int err = os::Solaris::commit_memory_impl(addr, bytes, alignment_hint, exec);
+  if (err != 0) {
+    // the caller wants all commit errors to exit with the specified mesg:
+    warn_fail_commit_memory(addr, bytes, alignment_hint, exec, err);
+    vm_exit_out_of_memory(bytes, mesg);
+  }
 }
 
 // Uncommit the pages in a specified region.
@@ -2806,7 +2934,7 @@ void os::pd_free_memory(char* addr, size_t bytes, size_t alignment_hint) {
 }
 
 bool os::pd_create_stack_guard_pages(char* addr, size_t size) {
-  return os::commit_memory(addr, size);
+  return os::commit_memory(addr, size, !ExecMem);
 }
 
 bool os::remove_stack_guard_pages(char* addr, size_t size) {
@@ -3428,21 +3556,20 @@ char* os::reserve_memory_special(size_t size, char* addr, bool exec) {
   }
 
   // The memory is committed
-  address pc = CALLER_PC;
-  MemTracker::record_virtual_memory_reserve((address)retAddr, size, pc);
-  MemTracker::record_virtual_memory_commit((address)retAddr, size, pc);
+  MemTracker::record_virtual_memory_reserve_and_commit((address)retAddr, size, mtNone, CURRENT_PC);
 
   return retAddr;
 }
 
 bool os::release_memory_special(char* base, size_t bytes) {
+  MemTracker::Tracker tkr = MemTracker::get_virtual_memory_release_tracker();
   // detaching the SHM segment will also delete it, see reserve_memory_special()
   int rslt = shmdt(base);
   if (rslt == 0) {
-    MemTracker::record_virtual_memory_uncommit((address)base, bytes);
-    MemTracker::record_virtual_memory_release((address)base, bytes);
+    tkr.record((address)base, bytes);
     return true;
   } else {
+    tkr.discard();
    return false;
   }
 }
@@ -4188,6 +4315,68 @@ void os::hint_no_preempt() {
   schedctl_start(schedctl_init());
 }
 
+static void resume_clear_context(OSThread *osthread) {
+  osthread->set_ucontext(NULL);
+}
+
+static void suspend_save_context(OSThread *osthread, ucontext_t* context) {
+  osthread->set_ucontext(context);
+}
+
+static Semaphore sr_semaphore;
+
+void os::Solaris::SR_handler(Thread* thread, ucontext_t* uc) {
+  // Save and restore errno to avoid confusing native code with EINTR
+  // after sigsuspend.
+  int old_errno = errno;
+
+  OSThread* osthread = thread->osthread();
+  assert(thread->is_VM_thread() || thread->is_Java_thread(), "Must be VMThread or JavaThread");
+
+  os::SuspendResume::State current = osthread->sr.state();
+  if (current == os::SuspendResume::SR_SUSPEND_REQUEST) {
+    suspend_save_context(osthread, uc);
+
+    // attempt to switch the state, we assume we had a SUSPEND_REQUEST
+    os::SuspendResume::State state = osthread->sr.suspended();
+    if (state == os::SuspendResume::SR_SUSPENDED) {
+      sigset_t suspend_set;  // signals for sigsuspend()
+
+      // get current set of blocked signals and unblock resume signal
+      thr_sigsetmask(SIG_BLOCK, NULL, &suspend_set);
+      sigdelset(&suspend_set, os::Solaris::SIGasync());
+
+      sr_semaphore.signal();
+      // wait here until we are resumed
+      while (1) {
+        sigsuspend(&suspend_set);
+
+        os::SuspendResume::State result = osthread->sr.running();
+        if (result == os::SuspendResume::SR_RUNNING) {
+          sr_semaphore.signal();
+          break;
+        }
+      }
+
+    } else if (state == os::SuspendResume::SR_RUNNING) {
+      // request was cancelled, continue
+    } else {
+      ShouldNotReachHere();
+    }
+
+    resume_clear_context(osthread);
+  } else if (current == os::SuspendResume::SR_RUNNING) {
+    // request was cancelled, continue
+  } else if (current == os::SuspendResume::SR_WAKEUP_REQUEST) {
+    // ignore
+  } else {
+    // ignore
+  }
+
+  errno = old_errno;
+}
+
+
 void os::interrupt(Thread* thread) {
   assert(Thread::current() == thread || Threads_lock->owned_by_self(), "possibility of dangling Thread pointer");
 
@@ -4285,8 +4474,9 @@ static const int RANDOMLY_LARGE_INTEGER2 = 100;
 
 static bool do_suspend(OSThread* osthread) {
   assert(osthread->sr.is_running(), "thread should be running");
-  // mark as suspended and send signal
+  assert(!sr_semaphore.trywait(), "semaphore has invalid state");
 
+  // mark as suspended and send signal
   if (osthread->sr.request_suspend() != os::SuspendResume::SR_SUSPEND_REQUEST) {
     // failed to switch, state wasn't running?
     ShouldNotReachHere();
@@ -4294,35 +4484,22 @@ static bool do_suspend(OSThread* osthread) {
   }
 
   if (sr_notify(osthread) != 0) {
-    // try to cancel, switch to running
-
-    os::SuspendResume::State result = osthread->sr.cancel_suspend();
-    if (result == os::SuspendResume::SR_RUNNING) {
-      // cancelled
-      return false;
-    } else if (result == os::SuspendResume::SR_SUSPENDED) {
-      // somehow managed to suspend
-      return true;
-    } else {
-      ShouldNotReachHere();
-      return false;
-    }
+    ShouldNotReachHere();
   }
 
   // managed to send the signal and switch to SUSPEND_REQUEST, now wait for SUSPENDED
-
-  for (int n = 0; !osthread->sr.is_suspended(); n++) {
-    for (int i = 0; i < RANDOMLY_LARGE_INTEGER2 && !osthread->sr.is_suspended(); i++) {
-      os::yield_all(i);
-    }
-
-    // timeout, try to cancel the request
-    if (n >= RANDOMLY_LARGE_INTEGER) {
+  while (true) {
+    if (sr_semaphore.timedwait(0, 2000 * NANOSECS_PER_MILLISEC)) {
+      break;
+    } else {
+      // timeout
       os::SuspendResume::State cancelled = osthread->sr.cancel_suspend();
       if (cancelled == os::SuspendResume::SR_RUNNING) {
         return false;
       } else if (cancelled == os::SuspendResume::SR_SUSPENDED) {
-        return true;
+        // make sure that we consume the signal on the semaphore as well
+        sr_semaphore.wait();
+        break;
       } else {
         ShouldNotReachHere();
         return false;
@@ -4336,6 +4513,7 @@ static bool do_suspend(OSThread* osthread) {
 
 static void do_resume(OSThread* osthread) {
   assert(osthread->sr.is_suspended(), "thread should be suspended");
+  assert(!sr_semaphore.trywait(), "invalid semaphore state");
 
   if (osthread->sr.request_wakeup() != os::SuspendResume::SR_WAKEUP_REQUEST) {
     // failed to switch to WAKEUP_REQUEST
@@ -4343,11 +4521,11 @@ static void do_resume(OSThread* osthread) {
     return;
   }
 
-  while (!osthread->sr.is_running()) {
+  while (true) {
     if (sr_notify(osthread) == 0) {
-      for (int n = 0; n < RANDOMLY_LARGE_INTEGER && !osthread->sr.is_running(); n++) {
-        for (int i = 0; i < 100 && !osthread->sr.is_running(); i++) {
-          os::yield_all(i);
+      if (sr_semaphore.timedwait(0, 2 * NANOSECS_PER_MILLISEC)) {
+        if (osthread->sr.is_running()) {
+          return;
         }
       }
     } else {

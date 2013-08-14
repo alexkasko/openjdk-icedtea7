@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999, 2012, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1999, 2013, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -70,10 +70,15 @@ class Linux {
   static pthread_t _main_thread;
   static Mutex* _createThread_lock;
   static int _page_size;
+  static const int _vm_default_page_size;
 
   static julong available_memory();
   static julong physical_memory() { return _physical_memory; }
   static void initialize_system_info();
+
+  static int commit_memory_impl(char* addr, size_t bytes, bool exec);
+  static int commit_memory_impl(char* addr, size_t bytes,
+                                size_t alignment_hint, bool exec);
 
   static void set_glibc_version(const char *s)      { _glibc_version = s; }
   static void set_libpthread_version(const char *s) { _libpthread_version = s; }
@@ -115,6 +120,8 @@ class Linux {
 
   static int page_size(void)                                        { return _page_size; }
   static void set_page_size(int val)                                { _page_size = val; }
+
+  static int vm_default_page_size(void)                             { return _vm_default_page_size; }
 
   static address   ucontext_get_pc(ucontext_t* uc);
   static intptr_t* ucontext_get_sp(ucontext_t* uc);
@@ -301,6 +308,6 @@ class PlatformParker : public CHeapObj<mtInternal> {
       status = pthread_mutex_init (_mutex, NULL);
       assert_status(status == 0, status, "mutex_init");
     }
-} ;
+};
 
 #endif // OS_LINUX_VM_OS_LINUX_HPP

@@ -669,5 +669,5 @@ endef
 #   version is actually being used (i.e. what is in PATH or COMPILER_PATH).
 include $(JDK_MAKE_SHARED_DIR)/Compiler-$(CC_VERSION).gmk
 
-JDK_DERIVATIVE_NAME=IcedTea 2.4.0
+JDK_DERIVATIVE_NAME=IcedTea 2.4.1
 DISTRO_NAME=Debian
