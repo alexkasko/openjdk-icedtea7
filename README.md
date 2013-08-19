@@ -7,8 +7,8 @@ applied patches from [IcedTea](http://icedtea.classpath.org/wiki/Main_Page) proj
 To obtain these sources IcedTea has been configured with the following options:
 
     ./configure \
-    --with-jdk-home=/home/alex/java/openjdk7_u6 \
-    --with-rhino=/home/alex/projects/openjdk/drops/rhino-1.7.4.jar \
+    --with-jdk-home=path/to/openjdk7 \
+    --with-rhino=path/to/rhino-1.7.4.jar \
     --disable-bootstrap \
     --disable-system-zlib \
     --disable-system-jpeg \
