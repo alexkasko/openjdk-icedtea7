@@ -266,10 +266,10 @@ if [ "${ZERO_BUILD}" = true ] ; then
 
   # ARCH_DATA_MODEL is the number of bits in a pointer
   case "${ZERO_LIBARCH}" in
-    i386|ppc|s390|sparc|arm|sh)
+    arm|i386|ppc|s390|sh|sparc)
       ARCH_DATA_MODEL=32
       ;;
-    amd64|ppc64|s390x|sparcv9|ia64|alpha)
+    aarch64|alpha|amd64|ia64|ppc64|s390x|sparcv9)
       ARCH_DATA_MODEL=64
       ;;
     *)
@@ -280,7 +280,7 @@ if [ "${ZERO_BUILD}" = true ] ; then
 
   # ZERO_ENDIANNESS is the endianness of the processor
   case "${ZERO_LIBARCH}" in
-    i386|amd64|ia64)
+    arm|aarch64|amd64|i386|ia64|mipsel)
       ZERO_ENDIANNESS=little
       ;;
     ppc*|s390*|sparc*|alpha)
@@ -306,6 +306,9 @@ if [ "${ZERO_BUILD}" = true ] ; then
   case "${ZERO_LIBARCH}" in
     s390)
       ZERO_ARCHFLAG="-m31"
+      ;;
+    arm|aarch64)
+      ZERO_ARCHFLAG="-D_LITTLE_ENDIAN"
       ;;
     *)
       ZERO_ARCHFLAG="-m${ARCH_DATA_MODEL}"
@@ -451,6 +454,14 @@ if [ "${GIF_LIBS}" = "" ] ; then
 fi
 export GIF_LIBS
 
+# Export variables for system krb5
+# KRB5_CFLAGS and KRB5_LIBS tell the compiler how to compile and
+# link against Kerberos
+if [ "${KRB5_LIBS}" = "" ] ; then
+    KRB5_LIBS="-lkrb5"
+fi
+export KRB5_LIBS
+
 # Setup nss.cfg using location of NSS libraries
 if [ -x "${pkgconfig}" ] ; then
   jdk_topdir=$(dirname ${BASH_SOURCE})/..
@@ -468,3 +479,4 @@ export SYSTEM_ZLIB=true
 export USE_SYSTEM_JPEG=true
 export USE_SYSTEM_PNG=true
 export USE_SYSTEM_GIF=true
+export SYSTEM_KRB5=true

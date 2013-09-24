@@ -46,6 +46,7 @@ ifeq ($(findstring true, $(JVM_VARIANT_ZERO) $(JVM_VARIANT_ZEROSHARK)), true)
   include $(MAKEFILES_DIR)/zeroshark.make
 else
   include $(MAKEFILES_DIR)/$(BUILDARCH).make
+  -include $(HS_ALT_MAKE)/$(Platform_os_family)/makefiles/$(BUILDARCH).make
 endif
 
 # set VPATH so make knows where to look for source files
@@ -105,6 +106,11 @@ endif
 # If not, ccache will not re-use the cache at all, since the version string might contain
 # a time and date.
 vm_version.o: CXXFLAGS += ${JRE_VERSION}
+
+# Large File Support
+ifneq ($(LP64), 1)
+ostream.o: CXXFLAGS += -D_FILE_OFFSET_BITS=64
+endif # ifneq ($(LP64), 1)
 
 ifeq ($(INCLUDE_TRACE), 1)
 CFLAGS += -DINCLUDE_TRACE=1
@@ -394,4 +400,5 @@ build: $(LIBJVM) $(LAUNCHER) $(LIBJSIG) $(LIBJVM_DB) $(BUILDLIBSAPROC) dtraceChe
 
 install: install_jvm install_jsig install_saproc
 
-.PHONY: default build install install_jvm
+.PHONY: default build install install_jvm $(HS_ALT_MAKE)/$(Platform_os_family)/makefiles/$(BUILDARCH).make
+

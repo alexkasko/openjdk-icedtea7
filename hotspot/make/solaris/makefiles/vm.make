@@ -89,14 +89,19 @@ ifdef DERIVATIVE_ID
 CPPFLAGS += -DDERIVATIVE_ID="\"$(DERIVATIVE_ID)\""
 endif
 
+ifdef DISTRIBUTION_ID
+CPPFLAGS += -DDISTRIBUTION_ID="\"$(DISTRIBUTION_ID)\""
+endif
+
 # This is VERY important! The version define must only be supplied to vm_version.o
 # If not, ccache will not re-use the cache at all, since the version string might contain
 # a time and date.
 vm_version.o: CXXFLAGS += ${JRE_VERSION}
 
-ifdef DISTRIBUTION_ID
-CPPFLAGS += -DDISTRIBUTION_ID="\"$(DISTRIBUTION_ID)\""
-endif
+# Large File Support
+ifneq ($(LP64), 1)
+ostream.o: CXXFLAGS += -D_FILE_OFFSET_BITS=64
+endif # ifneq ($(LP64), 1)
 
 # CFLAGS_WARN holds compiler options to suppress/enable warnings.
 CFLAGS += $(CFLAGS_WARN)

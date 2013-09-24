@@ -46,7 +46,7 @@ void objArrayKlass::objarray_follow_contents(oop obj, int index) {
   const size_t beg_index = size_t(index);
   assert(beg_index < len || len == 0, "index too large");
 
-  const size_t stride = MIN2(len - beg_index, ObjArrayMarkingStride);
+  const size_t stride = MIN2(len - beg_index, (size_t)ObjArrayMarkingStride);
   const size_t end_index = beg_index + stride;
   T* const base = (T*)a->base();
   T* const beg = base + beg_index;
@@ -80,7 +80,7 @@ void objArrayKlass::objarray_follow_contents(ParCompactionManager* cm, oop obj,
   const size_t beg_index = size_t(index);
   assert(beg_index < len || len == 0, "index too large");
 
-  const size_t stride = MIN2(len - beg_index, ObjArrayMarkingStride);
+  const size_t stride = MIN2(len - beg_index, (size_t)ObjArrayMarkingStride);
   const size_t end_index = beg_index + stride;
   T* const base = (T*)a->base();
   T* const beg = base + beg_index;

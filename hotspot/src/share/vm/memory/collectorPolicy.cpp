@@ -58,6 +58,13 @@
 // CollectorPolicy methods.
 
 void CollectorPolicy::initialize_flags() {
+  assert(max_alignment() >= min_alignment(),
+      err_msg("max_alignment: " SIZE_FORMAT " less than min_alignment: " SIZE_FORMAT,
+          max_alignment(), min_alignment()));
+  assert(max_alignment() % min_alignment() == 0,
+      err_msg("max_alignment: " SIZE_FORMAT " not aligned by min_alignment: " SIZE_FORMAT,
+          max_alignment(), min_alignment()));
+
   if (PermSize > MaxPermSize) {
     MaxPermSize = PermSize;
   }
@@ -230,9 +237,6 @@ void GenCollectorPolicy::initialize_flags() {
   // All sizes must be multiples of the generation granularity.
   set_min_alignment((uintx) Generation::GenGrain);
   set_max_alignment(compute_max_alignment());
-  assert(max_alignment() >= min_alignment() &&
-         max_alignment() % min_alignment() == 0,
-         "invalid alignment constraints");
 
   CollectorPolicy::initialize_flags();
 
@@ -357,7 +361,7 @@ void GenCollectorPolicy::initialize_size_info() {
       // generally small compared to the NewRatio calculation.
       _min_gen0_size = NewSize;
       desired_new_size = NewSize;
-      max_new_size = MAX2(max_new_size, NewSize);
+      max_new_size = MAX2(max_new_size, (size_t)NewSize);
     } else {
       // For the case where NewSize is the default, use NewRatio
       // to size the minimum and initial generation sizes.
@@ -365,10 +369,10 @@ void GenCollectorPolicy::initialize_size_info() {
       // NewRatio is overly large, the resulting sizes can be too
       // small.
       _min_gen0_size = MAX2(scale_by_NewRatio_aligned(min_heap_byte_size()),
-                          NewSize);
+                          (size_t)NewSize);
       desired_new_size =
         MAX2(scale_by_NewRatio_aligned(initial_heap_byte_size()),
-             NewSize);
+             (size_t)NewSize);
     }
 
     assert(_min_gen0_size > 0, "Sanity check");
@@ -423,14 +427,14 @@ bool TwoGenerationCollectorPolicy::adjust_gen0_sizes(size_t* gen0_size_ptr,
       // Adjust gen0 down to accomodate OldSize
       *gen0_size_ptr = heap_size - min_gen0_size;
       *gen0_size_ptr =
-        MAX2((uintx)align_size_down(*gen0_size_ptr, min_alignment()),
+        MAX2((size_t)align_size_down(*gen0_size_ptr, min_alignment()),
              min_alignment());
       assert(*gen0_size_ptr > 0, "Min gen0 is too large");
       result = true;
     } else {
       *gen1_size_ptr = heap_size - *gen0_size_ptr;
       *gen1_size_ptr =
-        MAX2((uintx)align_size_down(*gen1_size_ptr, min_alignment()),
+        MAX2((size_t)align_size_down(*gen1_size_ptr, min_alignment()),
                        min_alignment());
     }
   }
@@ -454,7 +458,7 @@ void TwoGenerationCollectorPolicy::initialize_size_info() {
   // for setting the gen1 maximum.
   _max_gen1_size = max_heap_byte_size() - _max_gen0_size;
   _max_gen1_size =
-    MAX2((uintx)align_size_down(_max_gen1_size, min_alignment()),
+    MAX2((size_t)align_size_down(_max_gen1_size, min_alignment()),
          min_alignment());
   // If no explicit command line flag has been set for the
   // gen1 size, use what is left for gen1.
@@ -468,11 +472,11 @@ void TwoGenerationCollectorPolicy::initialize_size_info() {
       "gen0 has an unexpected minimum size");
     set_min_gen1_size(min_heap_byte_size() - min_gen0_size());
     set_min_gen1_size(
-      MAX2((uintx)align_size_down(_min_gen1_size, min_alignment()),
+      MAX2((size_t)align_size_down(_min_gen1_size, min_alignment()),
            min_alignment()));
     set_initial_gen1_size(initial_heap_byte_size() - initial_gen0_size());
     set_initial_gen1_size(
-      MAX2((uintx)align_size_down(_initial_gen1_size, min_alignment()),
+      MAX2((size_t)align_size_down(_initial_gen1_size, min_alignment()),
            min_alignment()));
 
   } else {

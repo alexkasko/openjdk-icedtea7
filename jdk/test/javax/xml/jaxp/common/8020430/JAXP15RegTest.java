@@ -21,48 +21,43 @@
  * questions.
  */
 
-/*
+/**
  * @test
- * @bug 8011901
- * @summary instruct xaddL_no_res shouldn't allow 64 bit constants.
- * @run main/othervm -XX:-BackgroundCompilation Test8011901
- *
+ * @bug 8020430
+ * @summary test that setProperty for XMLOutputFactory works properly
+ * @run main/othervm JAXP15RegTest
  */
+import java.security.Policy;
+import javax.xml.stream.XMLOutputFactory;
 
-import java.lang.reflect.*;
-import sun.misc.*;
+/**
+ * @author huizhe.wang@oracle.com
+ */
+public class JAXP15RegTest extends TestBase {
 
-public class Test8011901 {
-
-    private long ctl;
-
-    private static final sun.misc.Unsafe U;
-    private static final long CTL;
-
-    static {
-        try {
-            Field unsafe = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-            unsafe.setAccessible(true);
-            U = (sun.misc.Unsafe) unsafe.get(null);
-            CTL = U.objectFieldOffset(Test8011901.class.getDeclaredField("ctl"));
-        } catch (Exception e) {
-            throw new Error(e);
-        }
+    public JAXP15RegTest(String name) {
+        super(name);
     }
 
+    private boolean hasSM;
+    private Policy _orig;
+
+
+    /**
+     * @param args the command line arguments
+     */
     public static void main(String[] args) {
-        for(int c = 0; c < 20000; c++) {
-            new Test8011901().makeTest();
-        }
-        System.out.println("Test Passed");
+        JAXP15RegTest test = new JAXP15RegTest("JAXP 1.5 regression");
+        test.setUp();
+        test.testXMLOutputFactory();
+        test.tearDown();
     }
 
-    public static final long EXPECTED = 1L << 42;
 
-    public void makeTest() {
-        U.getAndAddLong(this, CTL, EXPECTED);
-        if (ctl != EXPECTED) {
-            throw new RuntimeException("Test failed. Expected: " + EXPECTED + ", but got = " + ctl);
-        }
+    public void testXMLOutputFactory() {
+        XMLOutputFactory factory = XMLOutputFactory.newInstance();
+        factory.setProperty(XMLOutputFactory.IS_REPAIRING_NAMESPACES, true);
+        success("testXMLOutputFactory passed");
     }
+
 }

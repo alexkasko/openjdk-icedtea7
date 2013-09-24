@@ -244,6 +244,27 @@ static ObsoleteFlag obsolete_jvm_flags[] = {
                            JDK_Version::jdk_update(6,27), JDK_Version::jdk(8) },
   { "AllowTransitionalJSR292",       JDK_Version::jdk(7), JDK_Version::jdk(8) },
   { "UseCompressedStrings",          JDK_Version::jdk(7), JDK_Version::jdk(8) },
+  { "AlwaysInflate",       JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "AnonymousClasses",    JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "CMSOldPLABReactivityCeiling",
+                           JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "EventLogLength",      JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "GCOverheadReporting", JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "GCOverheadReportingPeriodMS",
+                           JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "HPILibPath",          JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "PreSpinYield",        JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "PreBlockSpin",        JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "PostSpinYield",       JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "PreserveMarkStackSize",
+                           JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "ReadSpinIterations",  JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "StressTieredRuntime", JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "Tier1Inline",         JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "Tier1FreqInlineSize", JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "Tier1MaxInlineSize",  JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "Tier1LoopOptsCount",  JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
+  { "UseSpinning",         JDK_Version::jdk_update(7,40), JDK_Version::jdk(8) },
 #ifdef PRODUCT
   { "DesiredMethodLimit",
                            JDK_Version::jdk_update(7, 2), JDK_Version::jdk(8) },
@@ -1219,7 +1240,7 @@ void Arguments::set_cms_and_parnew_gc_flags() {
       // so it's NewRatio x of NewSize.
       if (FLAG_IS_DEFAULT(OldSize)) {
         if (max_heap > NewSize) {
-          FLAG_SET_ERGO(uintx, OldSize, MIN2(NewRatio*NewSize, max_heap - NewSize));
+          FLAG_SET_ERGO(uintx, OldSize, MIN2((size_t)(NewRatio*NewSize), max_heap - NewSize));
           if (PrintGCDetails && Verbose) {
             // Too early to use gclog_or_tty
             tty->print_cr("CMS ergo set OldSize: " SIZE_FORMAT, OldSize);
@@ -1504,7 +1525,9 @@ void Arguments::set_heap_base_min_address() {
     // By default HeapBaseMinAddress is 2G on all platforms except Solaris x86.
     // G1 currently needs a lot of C-heap, so on Solaris we have to give G1
     // some extra space for the C-heap compared to other collectors.
-    FLAG_SET_ERGO(uintx, HeapBaseMinAddress, 1*G);
+    // Use FLAG_SET_DEFAULT here rather than FLAG_SET_ERGO to make sure that
+    // code that checks for default values work correctly.
+    FLAG_SET_DEFAULT(HeapBaseMinAddress, 1*G);
   }
 }
 

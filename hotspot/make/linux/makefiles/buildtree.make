@@ -195,7 +195,6 @@ flags.make: $(BUILDTREE_MAKE) ../shared_dirs.lst
 	$(BUILDTREE_COMMENT); \
 	echo; \
 	echo "Platform_file = $(PLATFORM_FILE)" | sed 's|$(GAMMADIR)|$$(GAMMADIR)|'; \
-	echo "JVM_VARIANTS = $(JVM_VARIANTS)"; \
 	sed -n '/=/s/^ */Platform_/p' < $(PLATFORM_FILE); \
 	echo; \
 	echo "GAMMADIR = $(GAMMADIR)"; \
@@ -210,6 +209,7 @@ flags.make: $(BUILDTREE_MAKE) ../shared_dirs.lst
 	echo "HOTSPOT_BUILD_USER = $(HOTSPOT_BUILD_USER)"; \
 	echo "HOTSPOT_VM_DISTRO = $(HOTSPOT_VM_DISTRO)"; \
 	echo "OPENJDK = $(OPENJDK)"; \
+	echo "ZERO_BUILD = $(ZERO_BUILD)"; \
 	echo; \
 	echo "# Used for platform dispatching"; \
 	echo "TARGET_DEFINES  = -DTARGET_OS_FAMILY_\$$(Platform_os_family)"; \

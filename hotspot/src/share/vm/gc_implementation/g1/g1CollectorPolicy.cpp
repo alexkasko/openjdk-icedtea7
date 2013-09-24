@@ -309,7 +309,8 @@ G1CollectorPolicy::G1CollectorPolicy() :
 
 void G1CollectorPolicy::initialize_flags() {
   set_min_alignment(HeapRegion::GrainBytes);
-  set_max_alignment(GenRemSet::max_alignment_constraint(rem_set_name()));
+  size_t card_table_alignment = GenRemSet::max_alignment_constraint(rem_set_name());
+  set_max_alignment(MAX2(card_table_alignment, min_alignment()));
   if (SurvivorRatio < 1) {
     vm_exit_during_initialization("Invalid survivor ratio specified");
   }
@@ -869,7 +870,7 @@ bool G1CollectorPolicy::need_to_start_conc_mark(const char* source, size_t alloc
   size_t alloc_byte_size = alloc_word_size * HeapWordSize;
 
   if ((cur_used_bytes + alloc_byte_size) > marking_initiating_used_threshold) {
-    if (gcs_are_young()) {
+    if (gcs_are_young() && !_last_young_gc) {
       ergo_verbose5(ErgoConcCycles,
         "request concurrent cycle initiation",
         ergo_format_reason("occupancy higher than threshold")
@@ -927,7 +928,7 @@ void G1CollectorPolicy::record_collection_pause_end(double pause_time_ms, Evacua
   last_pause_included_initial_mark = during_initial_mark_pause();
   if (last_pause_included_initial_mark) {
     record_concurrent_mark_init_end(0.0);
-  } else if (!_last_young_gc && need_to_start_conc_mark("end of GC")) {
+  } else if (need_to_start_conc_mark("end of GC")) {
     // Note: this might have already been set, if during the last
     // pause we decided to start a cycle but at the beginning of
     // this pause we decided to postpone it. That's OK.
