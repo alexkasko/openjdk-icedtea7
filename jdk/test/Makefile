@@ -525,7 +525,7 @@ jdk_other: $(call TestDirs, \
 JDK_ALL_TARGETS += jdk_misc
 jdk_misc: $(call TestDirs, \
           demo/jvmti demo/zipfs javax/naming javax/script \
-          javax/smartcardio javax/xml/soap com/sun/jndi com/sun/xml sun/misc)
+          javax/smartcardio javax/xml/soap com/sun/jndi com/sun/xml sun/misc misc)
 	$(call RunAgentvmBatch)
 
 # Stable samevm testruns (minus items from PROBLEM_LIST)
